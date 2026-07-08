@@ -229,16 +229,14 @@ library GenericLogic {
       user
     );
     if (userTotalDebt != 0) {
-      userTotalDebt = userTotalDebt.rayMul(reserve.getNormalizedDebt());
+      userTotalDebt = userTotalDebt.rayMulCeil(reserve.getNormalizedDebt());
     }
 
     userTotalDebt = userTotalDebt + IERC20(reserve.stableDebtTokenAddress).balanceOf(user);
 
     userTotalDebt = assetPrice * userTotalDebt;
 
-    unchecked {
-      return userTotalDebt / assetUnit;
-    }
+    return _ceilDiv(userTotalDebt, assetUnit);
   }
 
   /**
@@ -258,12 +256,15 @@ library GenericLogic {
     uint256 assetUnit
   ) private view returns (uint256) {
     uint256 normalizedIncome = reserve.getNormalizedIncome();
-    uint256 balance = (
-      IScaledBalanceToken(reserve.aTokenAddress).scaledBalanceOf(user).rayMul(normalizedIncome)
-    ) * assetPrice;
+    uint256 scaledBalance = IScaledBalanceToken(reserve.aTokenAddress).scaledBalanceOf(user);
+    uint256 balance = scaledBalance.rayMulFloor(normalizedIncome) * assetPrice;
 
     unchecked {
       return balance / assetUnit;
     }
+  }
+
+  function _ceilDiv(uint256 value, uint256 divisor) private pure returns (uint256) {
+    return value == 0 ? 0 : ((value - 1) / divisor) + 1;
   }
 }

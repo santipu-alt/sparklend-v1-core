@@ -17,6 +17,15 @@ abstract contract ScaledBalanceTokenBase is MintableIncentivizedERC20, IScaledBa
   using WadRayMath for uint256;
   using SafeCast for uint256;
 
+  enum RoundingMode {
+    INACTIVE,
+    ROUND_DOWN,
+    ROUND_UP
+  }
+
+  bytes32 private constant ROUNDING_STORAGE_SLOT =
+    bytes32(uint256(keccak256('sparklend.scaledBalanceToken.rounding')) - 1);
+
   /**
    * @dev Constructor.
    * @param pool The reference to the main Pool contract
@@ -55,6 +64,48 @@ abstract contract ScaledBalanceTokenBase is MintableIncentivizedERC20, IScaledBa
     return _userState[user].additionalData;
   }
 
+  function _setRoundingDown() internal {
+    _setRounding(RoundingMode.ROUND_DOWN);
+  }
+
+  function _setRoundingUp() internal {
+    _setRounding(RoundingMode.ROUND_UP);
+  }
+
+  function _setRounding(RoundingMode roundingMode) private {
+    bytes32 slot = ROUNDING_STORAGE_SLOT;
+    uint256 roundingModeUint = uint256(roundingMode);
+    assembly {
+      sstore(slot, roundingModeUint)
+    }
+  }
+
+  function _consumeRounding() private returns (RoundingMode) {
+    RoundingMode roundingMode = _getRounding();
+    require(roundingMode != RoundingMode.INACTIVE, Errors.INACTIVE_ROUNDING);
+    _setRounding(RoundingMode.INACTIVE);
+    return roundingMode;
+  }
+
+  function _getRounding() private view returns (RoundingMode) {
+    bytes32 slot = ROUNDING_STORAGE_SLOT;
+    uint256 roundingModeUint;
+    assembly {
+      roundingModeUint := sload(slot)
+    }
+
+    return RoundingMode(roundingModeUint);
+  }
+
+  function _rayDivByRounding(
+    uint256 amount,
+    uint256 index,
+    RoundingMode roundingMode
+  ) private pure returns (uint256) {
+    return
+      roundingMode == RoundingMode.ROUND_UP ? amount.rayDivCeil(index) : amount.rayDivFloor(index);
+  }
+
   /**
    * @notice Implements the basic logic to mint a scaled balance token.
    * @param caller The address performing the mint
@@ -69,7 +120,7 @@ abstract contract ScaledBalanceTokenBase is MintableIncentivizedERC20, IScaledBa
     uint256 amount,
     uint256 index
   ) internal returns (bool) {
-    uint256 amountScaled = amount.rayDiv(index);
+    uint256 amountScaled = _rayDivByRounding(amount, index, _consumeRounding());
     require(amountScaled != 0, Errors.INVALID_MINT_AMOUNT);
 
     uint256 scaledBalance = super.balanceOf(onBehalfOf);
@@ -97,7 +148,7 @@ abstract contract ScaledBalanceTokenBase is MintableIncentivizedERC20, IScaledBa
    * @param index The variable debt index of the reserve
    */
   function _burnScaled(address user, address target, uint256 amount, uint256 index) internal {
-    uint256 amountScaled = amount.rayDiv(index);
+    uint256 amountScaled = _rayDivByRounding(amount, index, _consumeRounding());
     require(amountScaled != 0, Errors.INVALID_BURN_AMOUNT);
 
     uint256 scaledBalance = super.balanceOf(user);
@@ -127,7 +178,12 @@ abstract contract ScaledBalanceTokenBase is MintableIncentivizedERC20, IScaledBa
    * @param amount The amount getting transferred
    * @param index The next liquidity index of the reserve
    */
-  function _transfer(address sender, address recipient, uint256 amount, uint256 index) internal {
+  function _transfer(
+    address sender,
+    address recipient,
+    uint256 amount,
+    uint256 index
+  ) internal returns (uint256) {
     uint256 senderScaledBalance = super.balanceOf(sender);
     uint256 senderBalanceIncrease = senderScaledBalance.rayMul(index) -
       senderScaledBalance.rayMul(_userState[sender].additionalData);
@@ -139,7 +195,8 @@ abstract contract ScaledBalanceTokenBase is MintableIncentivizedERC20, IScaledBa
     _userState[sender].additionalData = index.toUint128();
     _userState[recipient].additionalData = index.toUint128();
 
-    super._transfer(sender, recipient, amount.rayDiv(index).toUint128());
+    uint256 amountScaled = _rayDivByRounding(amount, index, _consumeRounding());
+    super._transfer(sender, recipient, amountScaled.toUint128());
 
     if (senderBalanceIncrease > 0) {
       emit Transfer(address(0), sender, senderBalanceIncrease);
@@ -152,5 +209,7 @@ abstract contract ScaledBalanceTokenBase is MintableIncentivizedERC20, IScaledBa
     }
 
     emit Transfer(sender, recipient, amount);
+
+    return amountScaled;
   }
 }

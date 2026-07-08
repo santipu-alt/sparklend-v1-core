@@ -7,7 +7,6 @@ import {IAToken} from '../../../interfaces/IAToken.sol';
 import {Errors} from '../helpers/Errors.sol';
 import {UserConfiguration} from '../configuration/UserConfiguration.sol';
 import {DataTypes} from '../types/DataTypes.sol';
-import {WadRayMath} from '../math/WadRayMath.sol';
 import {PercentageMath} from '../math/PercentageMath.sol';
 import {ValidationLogic} from './ValidationLogic.sol';
 import {ReserveLogic} from './ReserveLogic.sol';
@@ -24,7 +23,6 @@ library SupplyLogic {
   using GPv2SafeERC20 for IERC20;
   using UserConfiguration for DataTypes.UserConfigurationMap;
   using ReserveConfiguration for DataTypes.ReserveConfigurationMap;
-  using WadRayMath for uint256;
   using PercentageMath for uint256;
 
   // See `IPool` for descriptions
@@ -115,9 +113,7 @@ library SupplyLogic {
 
     reserve.updateState(reserveCache);
 
-    uint256 userBalance = IAToken(reserveCache.aTokenAddress).scaledBalanceOf(msg.sender).rayMul(
-      reserveCache.nextLiquidityIndex
-    );
+    uint256 userBalance = IAToken(reserveCache.aTokenAddress).balanceOf(msg.sender);
 
     uint256 amountToWithdraw = params.amount;
 
