@@ -74,6 +74,29 @@ library WadRayMath {
   }
 
   /**
+   * @notice Multiplies two ray, rounding down
+   * @param a Ray
+   * @param b Ray
+   * @return c = a raymul b, rounded down
+   */
+  function rayMulFloor(uint256 a, uint256 b) internal pure returns (uint256 c) {
+    return (a * b) / RAY;
+  }
+
+  /**
+   * @notice Multiplies two ray, rounding up
+   * @param a Ray
+   * @param b Ray
+   * @return c = a raymul b, rounded up
+   */
+  function rayMulCeil(uint256 a, uint256 b) internal pure returns (uint256 c) {
+    if (a == 0 || b == 0) {
+      return 0;
+    }
+    return ((a * b - 1) / RAY) + 1;
+  }
+
+  /**
    * @notice Divides two ray, rounding half up to the nearest ray
    * @dev assembly optimized for improved gas savings, see https://twitter.com/transmissions11/status/1451131036377571328
    * @param a Ray
@@ -89,6 +112,30 @@ library WadRayMath {
 
       c := div(add(mul(a, RAY), div(b, 2)), b)
     }
+  }
+
+  /**
+   * @notice Divides two ray, rounding down
+   * @param a Ray
+   * @param b Ray
+   * @return c = a raydiv b, rounded down
+   */
+  function rayDivFloor(uint256 a, uint256 b) internal pure returns (uint256 c) {
+    return (a * RAY) / b;
+  }
+
+  /**
+   * @notice Divides two ray, rounding up
+   * @param a Ray
+   * @param b Ray
+   * @return c = a raydiv b, rounded up
+   */
+  function rayDivCeil(uint256 a, uint256 b) internal pure returns (uint256 c) {
+    require(b != 0);
+    if (a == 0) {
+      return 0;
+    }
+    return ((a * RAY - 1) / b) + 1;
   }
 
   /**
