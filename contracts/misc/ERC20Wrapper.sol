@@ -39,7 +39,6 @@ contract ERC20Wrapper is ERC20 {
     _asset = IERC20(address(asset_));
     _assetDecimals = assetDecimals_;
     _shareScale = 10 ** (18 - assetDecimals_);
-    _setupDecimals(18);
   }
 
   function asset() external view returns (address) {
