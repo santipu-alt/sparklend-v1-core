@@ -15,20 +15,16 @@ token, math, liquidation, and generic logic contracts were left untouched.
 
 Added files:
 
-- `contracts/misc/ERC4626Wrapper.sol`
+- `contracts/misc/ERC20Wrapper.sol`
 
-  - A thin wrapper around OpenZeppelin Contracts `4.9.6` `ERC4626`.
-  - Keeps the local code limited to selecting an 18-decimal share offset for
-    lower-decimal assets.
+  - A fixed-rate wrapper built on the repo's vendored `ERC20`.
+  - Uses the repo's vendored `GPv2SafeERC20` for underlying transfers.
   - Exposes 18-decimal wrapper shares for underlying assets with decimals `<= 18`.
-  - Inherits OpenZeppelin's ERC-4626 conversion directions:
-    - `deposit`: shares round down.
-    - `mint`: assets round up.
-    - `withdraw`: shares round up.
-    - `redeem`: assets round down.
-  - Inherits OpenZeppelin's virtual asset/share offset pattern so an empty
-    6-decimal asset wrapper maps `1` raw underlying unit to `1e12` wrapper share
-    wei.
+  - Mints and redeems at a fixed whole-token 1:1 rate:
+    - `shares = assets * 10 ** (18 - underlyingDecimals)`.
+    - `assets = shares / 10 ** (18 - underlyingDecimals)`.
+  - Rejects redemption of wrapper dust that is not an exact multiple of the
+    scale factor.
 
 - `test-suites/wrapper-listing.spec.ts`
   - Adds focused wrapper tests and integration tests against the current Pool.
@@ -38,9 +34,8 @@ Updated dependency metadata:
 - `package.json`
 - `package-lock.json`
 
-These add `@openzeppelin/contracts@4.9.6`, the latest OpenZeppelin Contracts line
-compatible with this repo's Solidity `0.8.10` compiler target. OpenZeppelin
-Contracts `5.x` requires a newer Solidity compiler.
+These remove the previously added `@openzeppelin/contracts` dependency. The wrapper
+now uses only dependencies already vendored in this repository.
 
 ## Feasibility
 
@@ -68,7 +63,8 @@ rounding leak is no longer economically exploitable:
   share wei.
 - For a 6-decimal asset, `1` raw unit maps to `1e12` wrapper share wei.
 - A one-unit Pool rounding error is therefore one wrapper share wei.
-- `previewRedeem(1)` returns `0` raw units in the test wrapper.
+- `previewRedeem(1)` returns `0` raw units in the test wrapper, and `redeem(1)`
+  reverts because one wrapper wei is not a whole raw-asset unit.
 - To redeem one raw unit, an attacker would need to accumulate `10 ** (18 - d)`
   wrapper share wei, while paying for many protocol operations.
 
@@ -81,7 +77,7 @@ economic mitigation.
 Command used:
 
 ```bash
-source ~/.nvm/nvm.sh && nvm use 18.20.8 && MARKET_NAME=Test ENABLE_REWARDS=false TS_NODE_TRANSPILE_ONLY=1 npx hardhat test test-suites/__setup.spec.ts test-suites/wrapper-listing.spec.ts
+source ~/.nvm/nvm.sh && nvm use 18.20.8 && . ./setup-test-env.sh && TS_NODE_TRANSPILE_ONLY=1 npx hardhat test test-suites/__setup.spec.ts test-suites/wrapper-listing.spec.ts
 ```
 
 Result:
@@ -98,17 +94,17 @@ Notes:
 
 Test coverage added:
 
-- Wrapper conversion and ERC-4626 rounding:
+- Wrapper conversion and fixed-rate redemption:
   - 18-decimal shares.
   - 6-decimal raw asset maps `1` raw unit to `1e12` share wei.
   - `previewRedeem(1) == 0`.
-  - Donation-induced non-integer exchange rate rounds deposits down and withdrawals
-    up.
+  - `redeem(1)` reverts because wrapper dust is not a whole raw-asset unit.
+  - Direct underlying transfers do not change the fixed conversion rate.
 - Pool reserve listing:
   - Wrapper can be initialized as a reserve through the existing configurator.
   - Raw low-decimal asset is not listed.
   - Supplying wrapper shares to the Pool and withdrawing one wrapper share wei works.
-  - Redeeming that one wrapper share wei extracts zero raw underlying units.
+  - Redeeming that one wrapper share wei reverts.
 - Borrow/repay:
   - Wrapper reserve can be borrowed at variable rate.
   - Variable debt is denominated in wrapper share units.
@@ -128,29 +124,28 @@ Existing direct markets need migration. For an already-listed asset, the safe pa
 to freeze or disable the risky side, migrate users/liquidity into the wrapper reserve,
 then unlist the raw reserve or keep it non-collateral and non-borrowable.
 
-Oracle design is critical. The test uses a static mock price because the tested
-wrapper flow has a 1:1 decimal-normalized exchange rate. This wrapper inherits
-OpenZeppelin ERC4626 and `totalAssets()` includes direct underlying transfers, so
-donations or yield can increase share price. For a borrowable production reserve,
-use either:
+Oracle design is simple with the fixed-rate wrapper.
+The wrapper conversion rate is static: one whole wrapper token claims one whole
+underlying token. A static 1:1 decimal-normalized wrapper price is therefore
+consistent with the wrapper accounting, assuming the underlying itself is priced
+correctly.
 
-- a dynamic oracle that prices one wrapper share through `convertToAssets`, or
-- a stricter fixed-rate wrapper design with explicit donation/surplus handling.
-
-Static 1:1 pricing is not enough for a borrowable wrapper if share price can move.
-It can understate wrapper-denominated debt after donations or yield.
+Direct transfers of underlying into the wrapper create surplus underlying, but they
+do not increase the redemption value of wrapper shares. That avoids share-price
+drift, but it also means accidental donations are stuck unless a future version adds
+an explicitly governed surplus-recovery path.
 
 Underlying token assumptions matter. The wrapper assumes a standard, non-rebasing,
 non-fee-on-transfer ERC-20. Fee-on-transfer assets can make the wrapper over-mint.
-Rebasing or balance-mutating assets can move share price unexpectedly.
+Rebasing or balance-mutating assets can break the fixed 1:1 backing assumption.
 
 Stable borrowing remains a separate review item. The tests intentionally cover
 variable debt. If stable borrowing is enabled for a wrapper reserve, stable debt
 rounding and accrual should be reviewed separately.
 
-Dust UX needs care. A user can redeem tiny share dust for zero raw assets. This is
-conservative and protects the wrapper, but frontends and integrations should avoid
-offering zero-asset redemptions as useful actions.
+Dust UX needs care. Wrapper dust below one raw-asset unit cannot be redeemed. This
+is intentional for the rounding mitigation, but frontends and integrations should
+avoid presenting non-redeemable dust as useful withdrawable value.
 
 Liquidation-specific rounding was not separately fuzzed here. The core liquidation
 math still rounds as before, but with wrapper share wei as the accounting unit. That

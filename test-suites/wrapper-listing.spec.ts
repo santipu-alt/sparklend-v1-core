@@ -7,8 +7,8 @@ import { makeSuite, TestEnv } from './helpers/make-suite';
 import {
   AToken,
   AToken__factory,
-  ERC4626Wrapper,
-  ERC4626Wrapper__factory,
+  ERC20Wrapper,
+  ERC20Wrapper__factory,
   MintableERC20,
   MintableERC20__factory,
   MockReserveInterestRateStrategy__factory,
@@ -21,12 +21,9 @@ const RAW_DECIMALS = 6;
 const SHARE_SCALE = BigNumber.from(10).pow(18 - RAW_DECIMALS);
 const WRAPPER_PRICE = utils.parseUnits('1', 8);
 
-const divUp = (numerator: BigNumber, denominator: BigNumber) =>
-  numerator.add(denominator.sub(1)).div(denominator);
-
 makeSuite('Wrapper Listing mitigation', (testEnv: TestEnv) => {
   let rawAsset: MintableERC20;
-  let wrapper: ERC4626Wrapper;
+  let wrapper: ERC20Wrapper;
   let aWrapper: AToken;
   let variableDebtWrapper: VariableDebtToken;
   let snap: string;
@@ -39,7 +36,7 @@ makeSuite('Wrapper Listing mitigation', (testEnv: TestEnv) => {
       symbol,
       RAW_DECIMALS
     );
-    const wrapped = await new ERC4626Wrapper__factory(deployer.signer).deploy(
+    const wrapped = await new ERC20Wrapper__factory(deployer.signer).deploy(
       raw.address,
       `Wrapped ${symbol}`,
       `w${symbol}`
@@ -115,7 +112,7 @@ makeSuite('Wrapper Listing mitigation', (testEnv: TestEnv) => {
     await evmRevert(snap);
   });
 
-  it('uses ERC4626 rounding with 18-decimal shares', async () => {
+  it('wraps and unwraps at a fixed 1:1 whole-token rate with 18-decimal shares', async () => {
     const { users } = testEnv;
     const user = users[0];
     const deployed = await deployRawAssetAndWrapper('ROUND');
@@ -138,11 +135,15 @@ makeSuite('Wrapper Listing mitigation', (testEnv: TestEnv) => {
 
     await waitForTx(await raw.connect(user.signer).transfer(wrapped.address, 1));
 
-    const expectedDepositShares = SHARE_SCALE.mul(2).div(3);
-    const expectedWithdrawShares = divUp(SHARE_SCALE.mul(2), BigNumber.from(3));
+    expect(await wrapped.previewDeposit(1)).to.be.eq(SHARE_SCALE);
+    expect(await wrapped.previewWithdraw(1)).to.be.eq(SHARE_SCALE);
 
-    expect(await wrapped.previewDeposit(1)).to.be.eq(expectedDepositShares);
-    expect(await wrapped.previewWithdraw(1)).to.be.eq(expectedWithdrawShares);
+    await waitForTx(
+      await wrapped.connect(user.signer).redeem(SHARE_SCALE, user.address, user.address)
+    );
+
+    expect(await wrapped.balanceOf(user.address)).to.be.eq(0);
+    expect(await raw.balanceOf(user.address)).to.be.eq(2);
   });
 
   it('can be listed as the Pool reserve while the raw low-decimal asset stays unlisted', async () => {
@@ -172,7 +173,9 @@ makeSuite('Wrapper Listing mitigation', (testEnv: TestEnv) => {
     expect(await wrapper.balanceOf(user.address)).to.be.eq(1);
     expect(await wrapper.previewRedeem(1)).to.be.eq(0);
 
-    await waitForTx(await wrapper.connect(user.signer).redeem(1, user.address, user.address));
+    await expect(
+      wrapper.connect(user.signer).redeem(1, user.address, user.address)
+    ).to.be.revertedWith('WRAPPER_NON_WHOLE_ASSET');
 
     expect(await rawAsset.balanceOf(user.address)).to.be.eq(rawBalanceBeforeDustRedeem);
   });
