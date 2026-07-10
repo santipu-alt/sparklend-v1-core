@@ -140,14 +140,8 @@ abstract contract ScaledBalanceTokenBase is MintableIncentivizedERC20, IScaledBa
    * @param recipient The destination address
    * @param amount The amount getting transferred
    * @param index The next liquidity index of the reserve
-   * @return The scaled amount transferred
    */
-  function _transfer(
-    address sender,
-    address recipient,
-    uint256 amount,
-    uint256 index
-  ) internal returns (uint256) {
+  function _transfer(address sender, address recipient, uint256 amount, uint256 index) internal {
     uint256 senderScaledBalance = super.balanceOf(sender);
     uint256 senderBalanceIncrease = senderScaledBalance.rayMul(index) -
       senderScaledBalance.rayMul(_userState[sender].additionalData);
@@ -159,8 +153,7 @@ abstract contract ScaledBalanceTokenBase is MintableIncentivizedERC20, IScaledBa
     _userState[sender].additionalData = index.toUint128();
     _userState[recipient].additionalData = index.toUint128();
 
-    uint256 amountScaled = amount.rayDivCeil(index);
-    super._transfer(sender, recipient, amountScaled.toUint128());
+    super._transfer(sender, recipient, amount.rayDivCeil(index).toUint128());
 
     if (senderBalanceIncrease > 0) {
       emit Transfer(address(0), sender, senderBalanceIncrease);
@@ -173,7 +166,6 @@ abstract contract ScaledBalanceTokenBase is MintableIncentivizedERC20, IScaledBa
     }
 
     emit Transfer(sender, recipient, amount);
-    return amountScaled;
   }
 
   function _roundScaledAmount(

@@ -110,7 +110,7 @@ The shared mint and burn functions require a rounding mode:
 
 `_roundScaledAmount` selects `rayDivFloor` for `ROUND_DOWN`, selects `rayDivCeil` for `ROUND_UP`, and reverts with `Errors.INVALID_AMOUNT` for `INACTIVE`.
 
-The shared `_transfer(sender, recipient, amount, index)` helper does not accept a rounding mode. It always calculates `amountScaled` with `amount.rayDivCeil(index)` and returns the actual scaled amount moved so callers can report it consistently. This matches Aave v3.5's transfer rule: rounding scaled shares up ensures the recipient receives at least the requested unscaled amount.
+The shared `_transfer(sender, recipient, amount, index)` helper does not accept a rounding mode or return a value. It always calculates `amountScaled` with `amount.rayDivCeil(index)`. `AToken` applies the same ceiling conversion when emitting `BalanceTransfer`. This matches Aave v3.5's transfer rule: rounding scaled shares up ensures the recipient receives at least the requested unscaled amount.
 
 ### aToken mapping
 
@@ -127,7 +127,7 @@ The visible balance conversions were also changed:
 - `totalSupply` uses `rayMulFloor`;
 - the pre-transfer balances sent to `Pool.finalizeTransfer` use `rayMulFloor`.
 
-`BalanceTransfer` emits the actual scaled amount returned by the shared transfer helper. Together, these changes prevent supply from over-crediting a user and ensure that withdrawal or transfer consumes enough scaled balance for the requested asset amount.
+`BalanceTransfer` emits the scaled amount calculated with the same `rayDivCeil` conversion used by the shared transfer helper. Together, these changes prevent supply from over-crediting a user and ensure that withdrawal or transfer consumes enough scaled balance for the requested asset amount.
 
 ### Variable debt mapping
 
