@@ -80,7 +80,13 @@ library WadRayMath {
    * @return c = a raymul b, rounded down
    */
   function rayMulFloor(uint256 a, uint256 b) internal pure returns (uint256 c) {
-    return (a * b) / RAY;
+    assembly {
+      // Overflow check: Ensure a * b does not exceed uint256 max
+      if iszero(or(iszero(b), iszero(gt(a, div(not(0), b))))) {
+        revert(0, 0)
+      }
+      c := div(mul(a, b), RAY)
+    }
   }
 
   /**
@@ -90,10 +96,14 @@ library WadRayMath {
    * @return c = a raymul b, rounded up
    */
   function rayMulCeil(uint256 a, uint256 b) internal pure returns (uint256 c) {
-    if (a == 0 || b == 0) {
-      return 0;
+    assembly {
+      // Overflow check: Ensure a * b does not exceed uint256 max
+      if iszero(or(iszero(b), iszero(gt(a, div(not(0), b))))) {
+        revert(0, 0)
+      }
+      let product := mul(a, b)
+      c := add(div(product, RAY), iszero(iszero(mod(product, RAY))))
     }
-    return ((a * b - 1) / RAY) + 1;
   }
 
   /**
@@ -121,7 +131,13 @@ library WadRayMath {
    * @return c = a raydiv b, rounded down
    */
   function rayDivFloor(uint256 a, uint256 b) internal pure returns (uint256 c) {
-    return (a * RAY) / b;
+    assembly {
+      // Overflow check: Ensure a * RAY does not exceed uint256 max
+      if or(iszero(b), iszero(iszero(gt(a, div(not(0), RAY))))) {
+        revert(0, 0)
+      }
+      c := div(mul(a, RAY), b)
+    }
   }
 
   /**
@@ -131,11 +147,14 @@ library WadRayMath {
    * @return c = a raydiv b, rounded up
    */
   function rayDivCeil(uint256 a, uint256 b) internal pure returns (uint256 c) {
-    require(b != 0);
-    if (a == 0) {
-      return 0;
+    assembly {
+      // Overflow check: Ensure a * RAY does not exceed uint256 max
+      if or(iszero(b), iszero(iszero(gt(a, div(not(0), RAY))))) {
+        revert(0, 0)
+      }
+      let scaled := mul(a, RAY)
+      c := add(div(scaled, b), iszero(iszero(mod(scaled, b))))
     }
-    return ((a * RAY - 1) / b) + 1;
   }
 
   /**
