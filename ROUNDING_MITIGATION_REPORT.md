@@ -1,4 +1,4 @@
-# Rounding Direction Flag Mitigation Report
+# Rounding Direction Mitigation Report
 
 ## Scope
 
@@ -53,9 +53,9 @@ The protocol needs deterministic, pessimistic rounding at each accounting bounda
 - `contracts/protocol/libraries/logic/LiquidationLogic.sol`
 - `certora/specs/AToken.spec` and `certora/specs/VariableDebtToken.spec`, which still model the previous half-up rounding slack and require a separate formal-verification update
 
-## Chosen Approach: Rounding Direction Flag
+## Chosen Approach: Rounding Direction Flag With Explicit Transfer Rounding
 
-The chosen design represents the rounding context with an internal enum and passes it explicitly into the shared scaled-token accounting functions:
+The chosen design represents the operation-specific mint and burn rounding context with an internal enum and passes it explicitly into the shared scaled-token accounting functions:
 
 ```solidity
 enum RoundingMode {
@@ -65,9 +65,11 @@ enum RoundingMode {
 }
 ```
 
-Each token entry point selects the required direction before invoking shared mint, burn, or transfer accounting. The shared conversion function consumes that explicit mode and reverts if it receives `INACTIVE`.
+Each mint or burn entry point selects the required direction before invoking shared accounting. The shared conversion function consumes that explicit mode and reverts if it receives `INACTIVE`.
 
-The term _flag_ describes the operation-specific direction, but the flag is passed as an internal function argument rather than stored in contract state. It is therefore short-lived, visible at each call site, and cannot remain active across an external call.
+Transfers do not accept a rounding mode because their direction does not vary: aToken transfers always round the scaled amount up with `rayDivCeil`. Variable debt tokens are non-transferable, so there is no valid transfer path that needs `ROUND_DOWN`. Encoding this invariant directly prevents a future caller from accidentally selecting an unsafe transfer direction.
+
+The term _flag_ describes the operation-specific mint or burn direction, but the flag is passed as an internal function argument rather than stored in contract state. It is therefore short-lived, visible at each call site, and cannot remain active across an external call.
 
 ### Rationale
 
@@ -75,10 +77,11 @@ This approach was selected because it provides the required operation-specific r
 
 - It preserves the public Pool, aToken, and variable debt token ABIs.
 - It does not add a state variable and therefore does not change upgradeable-token storage layouts.
-- It avoids state set-and-clear gas costs on common mint, burn, and transfer paths.
+- It avoids state set-and-clear gas costs on common mint and burn paths.
 - It makes each rounding decision explicit at the call site, which improves auditability.
-- It centralizes the conversion logic instead of duplicating separate up/down mint, burn, and transfer helpers.
-- It fails closed: a future shared-accounting caller that supplies `INACTIVE` cannot silently fall back to half-up rounding.
+- It centralizes the conversion logic instead of duplicating separate up/down mint and burn helpers.
+- It fails closed: a future shared mint or burn caller that supplies `INACTIVE` cannot silently fall back to half-up rounding.
+- It hardcodes the single safe transfer direction, removing an unnecessary mode parameter and its misuse surface.
 - It leaves existing half-up ray functions intact for unrelated protocol math, limiting behavioral change to the vulnerable boundaries.
 
 A persistent storage flag was not used because storage added to `ScaledBalanceTokenBase` could shift child-contract storage, while leaf-level flags would require hooks or duplicated state handling. Persistent state would also introduce extra gas and hidden mutable context. Transient storage was not used because the repository targets Solidity `0.8.10` and the London EVM, where it is unavailable without a broader compiler and deployment-target migration.
@@ -100,13 +103,14 @@ The original half-up `rayMul` and `rayDiv` functions remain unchanged for protoc
 
 `contracts/protocol/tokenization/base/ScaledBalanceTokenBase.sol` defines `RoundingMode` and adds `_roundScaledAmount(amount, index, roundingMode)`.
 
-The shared functions now require a rounding mode:
+The shared mint and burn functions require a rounding mode:
 
 - `_mintScaled(..., RoundingMode roundingMode)`;
-- `_burnScaled(..., RoundingMode roundingMode)`;
-- `_transfer(..., RoundingMode roundingMode)`.
+- `_burnScaled(..., RoundingMode roundingMode)`.
 
-`_roundScaledAmount` selects `rayDivFloor` for `ROUND_DOWN`, selects `rayDivCeil` for `ROUND_UP`, and reverts with `Errors.INVALID_AMOUNT` for `INACTIVE`. The transfer helper returns the actual scaled amount moved so callers can report it consistently.
+`_roundScaledAmount` selects `rayDivFloor` for `ROUND_DOWN`, selects `rayDivCeil` for `ROUND_UP`, and reverts with `Errors.INVALID_AMOUNT` for `INACTIVE`.
+
+The shared `_transfer(sender, recipient, amount, index)` helper does not accept a rounding mode. It always calculates `amountScaled` with `amount.rayDivCeil(index)` and returns the actual scaled amount moved so callers can report it consistently. This matches Aave v3.5's transfer rule: rounding scaled shares up ensures the recipient receives at least the requested unscaled amount.
 
 ### aToken mapping
 
@@ -115,8 +119,7 @@ The shared functions now require a rounding mode:
 - `mint`: `ROUND_DOWN`;
 - `mintToTreasury`: `ROUND_DOWN`;
 - `burn`: `ROUND_UP`;
-- ordinary transfers: `ROUND_UP`;
-- liquidation transfers: `ROUND_UP`.
+- ordinary and liquidation transfers: direct `rayDivCeil` conversion.
 
 The visible balance conversions were also changed:
 
