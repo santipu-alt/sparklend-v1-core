@@ -208,7 +208,7 @@ contract AToken is VersionedInitializable, ScaledBalanceTokenBase, EIP712Base, I
     uint256 fromBalanceBefore = super.balanceOf(from).rayMulFloor(index);
     uint256 toBalanceBefore = super.balanceOf(to).rayMulFloor(index);
 
-    uint256 amountScaled = super._transfer(from, to, amount, index, RoundingMode.ROUND_UP);
+    uint256 amountScaled = super._transfer(from, to, amount, index);
 
     if (validate) {
       POOL.finalizeTransfer(underlyingAsset, from, to, amount, fromBalanceBefore, toBalanceBefore);

@@ -135,6 +135,7 @@ abstract contract ScaledBalanceTokenBase is MintableIncentivizedERC20, IScaledBa
   /**
    * @notice Implements the basic logic to transfer scaled balance tokens between two users
    * @dev It emits a mint event with the interest accrued per user
+   * @dev The scaled transfer amount is rounded up so the recipient receives at least the requested amount
    * @param sender The source address
    * @param recipient The destination address
    * @param amount The amount getting transferred
@@ -145,8 +146,7 @@ abstract contract ScaledBalanceTokenBase is MintableIncentivizedERC20, IScaledBa
     address sender,
     address recipient,
     uint256 amount,
-    uint256 index,
-    RoundingMode roundingMode
+    uint256 index
   ) internal returns (uint256) {
     uint256 senderScaledBalance = super.balanceOf(sender);
     uint256 senderBalanceIncrease = senderScaledBalance.rayMul(index) -
@@ -159,7 +159,7 @@ abstract contract ScaledBalanceTokenBase is MintableIncentivizedERC20, IScaledBa
     _userState[sender].additionalData = index.toUint128();
     _userState[recipient].additionalData = index.toUint128();
 
-    uint256 amountScaled = _roundScaledAmount(amount, index, roundingMode);
+    uint256 amountScaled = amount.rayDivCeil(index);
     super._transfer(sender, recipient, amountScaled.toUint128());
 
     if (senderBalanceIncrease > 0) {
