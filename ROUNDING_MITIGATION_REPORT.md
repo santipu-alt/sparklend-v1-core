@@ -2,7 +2,7 @@
 
 ## Scope
 
-This repository is a SparkLend fork based on older Aave V3 code. The implemented mitigation addresses the high-value, low-decimal asset rounding issue handled by Aave v3.5 without importing the complete Aave 3.1-3.7 upgrade history.
+This repository is a SparkLend fork based on older Aave V3 code. The implemented mitigation is a narrow backport of the protocol-favoring rounding directions introduced in Aave v3.5 for high-value, low-decimal assets. It does not wholesale-backport Aave's intervening scaled-accounting, interface, allowance, event, or flag-management changes.
 
 The fix is focused on the scaled-accounting and risk-valuation boundaries used by aTokens and variable debt tokens:
 
@@ -18,17 +18,19 @@ For an 18-decimal asset, a one-wei discrepancy is normally economically negligib
 
 The protocol needs deterministic, pessimistic rounding at each accounting boundary:
 
-| Operation                              | Required direction | Safety property                                                    |
-| -------------------------------------- | ------------------ | ------------------------------------------------------------------ |
-| aToken mint/supply                     | Down               | The user is not credited with more claim value than supplied.      |
-| aToken burn/withdraw                   | Up                 | The user burns enough scaled balance for the amount withdrawn.     |
-| aToken transfer                        | Up                 | The sender burns enough scaled balance for the amount transferred. |
-| aToken balance and total supply        | Down               | Collateral is not exposed or valued above its scaled claim.        |
-| Variable debt mint/borrow              | Up                 | The recorded debt is not smaller than the amount borrowed.         |
-| Variable debt burn/repay               | Down               | Repayment does not erase more scaled debt than it covers.          |
-| Variable debt balance and total supply | Up                 | Debt is not exposed or valued below its scaled obligation.         |
-| Collateral base-currency valuation     | Down               | Account collateral is not overstated.                              |
-| Debt base-currency valuation           | Up                 | Account debt is not understated.                                   |
+| Operation                               | Required direction | Safety property                                                    |
+| --------------------------------------- | ------------------ | ------------------------------------------------------------------ |
+| aToken mint/supply                      | Down               | The user is not credited with more claim value than supplied.      |
+| aToken burn/withdraw                    | Up                 | The user burns enough scaled balance for the amount withdrawn.     |
+| aToken transfer                         | Up                 | The sender burns enough scaled balance for the amount transferred. |
+| aToken balance and total supply         | Down               | The indexed aToken amount is not rounded above its exact value.    |
+| Variable debt mint/borrow               | Up                 | The recorded debt is not smaller than the amount borrowed.         |
+| Variable debt burn/repay                | Down               | Repayment does not erase more scaled debt than it covers.          |
+| Variable debt balance and total supply  | Up                 | Variable debt is not rounded below its exact indexed obligation.   |
+| Collateral base-currency conversion     | Down               | Account collateral is not overstated.                              |
+| Aggregate debt base-currency conversion | Up                 | The final price conversion does not discard positive debt dust.    |
+
+The variable-debt guarantees in this table do not extend to the stable debt token's own balance calculation. Stable debt is deprecated and is not an intended supported borrowing path, so updating its internal rounding would add complexity without providing useful protection for supported protocol operations. `StableDebtToken.balanceOf` therefore retains legacy half-up ray multiplication; `GenericLogic` still rounds up the final base-currency conversion of any aggregate variable-plus-legacy-stable debt amount.
 
 ## Resources
 
@@ -51,6 +53,8 @@ The protocol needs deterministic, pessimistic rounding at each accounting bounda
 - `contracts/protocol/libraries/logic/SupplyLogic.sol`
 - `contracts/protocol/libraries/logic/GenericLogic.sol`
 - `contracts/protocol/libraries/logic/LiquidationLogic.sol`
+- `contracts/mocks/tests/WadRayMathWrapper.sol`
+- `test-suites/wadraymath.spec.ts`
 - `certora/specs/AToken.spec` and `certora/specs/VariableDebtToken.spec`, which still model the previous half-up rounding slack and require a separate formal-verification update
 
 ## Chosen Approach: Rounding Direction Flag With Explicit Transfer Rounding
@@ -97,6 +101,8 @@ A persistent storage flag was not used because storage added to `ScaledBalanceTo
 - `rayDivFloor`;
 - `rayDivCeil`.
 
+The multiplication helpers compute `floor(a * b / RAY)` and `ceil(a * b / RAY)`. The division helpers compute `floor(a * RAY / b)` and `ceil(a * RAY / b)`. The ceiling variants add one only when the division has a non-zero remainder, so exact results are not over-rounded. The implementations and their overflow and division-by-zero guards are aligned with Aave v3.5.
+
 The original half-up `rayMul` and `rayDiv` functions remain unchanged for protocol calculations outside the scope of this mitigation.
 
 ### Shared scaled-balance accounting
@@ -108,9 +114,9 @@ The shared mint and burn functions require a rounding mode:
 - `_mintScaled(..., RoundingMode roundingMode)`;
 - `_burnScaled(..., RoundingMode roundingMode)`.
 
-`_roundScaledAmount` selects `rayDivFloor` for `ROUND_DOWN`, selects `rayDivCeil` for `ROUND_UP`, and reverts with `Errors.INVALID_AMOUNT` for `INACTIVE`.
+`_roundScaledAmount` selects `rayDivFloor` for `ROUND_DOWN`, selects `rayDivCeil` for `ROUND_UP`, and reverts with `Errors.INVALID_AMOUNT` for `INACTIVE`. The existing zero-scaled-amount checks remain in place and continue to use `INVALID_MINT_AMOUNT` or `INVALID_BURN_AMOUNT`.
 
-The shared `_transfer(sender, recipient, amount, index)` helper does not accept a rounding mode or return a value. It always calculates `amountScaled` with `amount.rayDivCeil(index)`. `AToken` applies the same ceiling conversion when emitting `BalanceTransfer`. This matches Aave v3.5's transfer rule: rounding scaled shares up ensures the recipient receives at least the requested unscaled amount.
+The shared `_transfer(sender, recipient, amount, index)` helper does not accept a rounding mode or return a value. It always converts the transfer amount with `amount.rayDivCeil(index)`. `AToken` applies the same ceiling conversion when emitting `BalanceTransfer`. This matches Aave v3.5's transfer rule: at the same index, rounding scaled shares up ensures the recipient's indexed balance increases by at least the requested unscaled amount.
 
 ### aToken mapping
 
@@ -127,7 +133,7 @@ The visible balance conversions were also changed:
 - `totalSupply` uses `rayMulFloor`;
 - the pre-transfer balances sent to `Pool.finalizeTransfer` use `rayMulFloor`.
 
-`BalanceTransfer` emits the scaled amount calculated with the same `rayDivCeil` conversion used by the shared transfer helper. Together, these changes prevent supply from over-crediting a user and ensure that withdrawal or transfer consumes enough scaled balance for the requested asset amount.
+`BalanceTransfer` emits the scaled amount calculated with the same `rayDivCeil` conversion used by the shared transfer helper. The ordinary ERC-20 `Transfer` event and the amount passed to `Pool.finalizeTransfer` remain the caller-requested unscaled amount; the precise rounded share movement is exposed by `BalanceTransfer`. Together, these changes prevent supply from over-crediting a user and ensure that withdrawal or transfer consumes enough scaled balance for the requested asset amount.
 
 ### Variable debt mapping
 
@@ -151,11 +157,12 @@ This keeps `withdraw(type(uint256).max)` aligned with the floor-rounded value re
 `contracts/protocol/libraries/logic/GenericLogic.sol` now applies risk-pessimistic rounding when calculating account data:
 
 - scaled variable debt is converted to unscaled debt with `rayMulCeil`;
-- total debt is converted to base currency with ceiling division;
+- the resulting variable debt is added to the stable debt token's reported balance;
+- that aggregate debt amount is converted to base currency with ceiling division;
 - scaled aToken collateral is converted to an unscaled balance with `rayMulFloor`;
 - collateral-to-base-currency conversion remains floor division.
 
-As a result, health-factor calculations do not overstate collateral or understate debt at rounding boundaries.
+The private `_divCeil` helper returns zero for a zero numerator and otherwise implements `ceil(value / divisor)` without an addition that could overflow. With a positive asset price, any non-zero aggregate debt therefore contributes at least one base-currency unit. For variable debt and aToken collateral, health-factor calculations no longer understate debt or overstate collateral at these conversion boundaries. Any legacy stable debt can still inherit half-up error from `StableDebtToken.balanceOf`; changing that deprecated path is intentionally outside the mitigation.
 
 ### Liquidation protocol-fee alignment
 
@@ -171,14 +178,20 @@ The mitigation removes user-favoring half-up rounding from the affected scaled-a
 2. Withdrawing or transferring cannot release value without consuming enough scaled aTokens.
 3. Borrowing cannot record less variable debt than the value received.
 4. Repayment cannot cancel more variable debt than the payment covers.
-5. Collateral and debt reads use the same pessimistic directions in account-data calculations.
+5. aToken collateral and variable-debt reads use the same pessimistic directions in account-data calculations.
+6. The final aggregate-debt price conversion rounds up, preventing positive, positively priced debt dust from disappearing solely in that division.
 
-The result is a consistent protocol-favoring invariant at the relevant boundaries, while unrelated interest-index, flash-loan, bridge-fee, and general percentage math retain their existing behavior.
+The result is a protocol-favoring invariant at the changed aToken and variable-debt boundaries, while unrelated interest-index, flash-loan, bridge-fee, and general percentage math retain their existing behavior. It is not a complete backport of all Aave v3.5 precision and scaled-accounting changes.
 
 ## Scope Boundaries and Follow-up Work
 
-- Stable debt rounding was not changed. If stable-rate borrowing is enabled for a high-value, low-decimal asset, it requires a separate pessimistic-rounding review.
-- Public interfaces and Pool/token ABIs were not changed.
+- Stable debt is deprecated and is not an intended supported borrowing path. Its rounding was intentionally left unchanged because backporting new behavior into an obsolete path would add implementation and verification cost without improving the supported variable-debt flow. Any legacy stable debt remains subject to `StableDebtToken.balanceOf`'s half-up rounding; the ceiling base-currency division cannot correct an amount already rounded down by that calculation.
+- Production public interfaces and Pool/token ABIs were not changed. The public test wrapper was extended solely to exercise the new library helpers.
 - No persistent or transient storage was added.
-- Broader cap, treasury-accrual, interest-index, flash-loan, and bridge-fee math was intentionally left outside this patch.
+- Operation amounts still cross the existing production interfaces in unscaled units and are converted inside the tokens. The broader v3.5 change to pass scaled amounts through Pool validations and token calls was not backported.
+- Allowances retain legacy amount-based behavior: `AToken.transferFrom` and delegated variable borrowing consume the requested unscaled amount, which can differ from the rounded balance or debt change.
+- Legacy `Mint`, `Burn`, and ERC-20 `Transfer` event values remain based on requested amounts and accrued interest rather than being recomputed from exact before/after indexed balances. `BalanceTransfer` is the exception and now reports the exact ceiling-rounded scaled transfer amount.
+- Withdraw and transfer collateral-flag updates still compare the requested unscaled amount with the floor-rounded pre-operation balance. A ceiling-rounded burn or transfer can consume the entire scaled balance even when a near-full explicit amount is slightly smaller than that displayed balance, so the legacy equality check can leave the collateral flag set with a zero scaled balance. The v3.5 scaled `finalizeTransfer` and balance-zero-after-burn flag changes were not backported and should be considered follow-up work.
+- The final `mintToTreasury` unscaled-to-scaled conversion now rounds down, but reserve-side treasury-accrual calculations were not changed. Broader cap, interest-index, flash-loan, bridge-fee, and percentage math was also intentionally left outside this patch.
 - Existing Certora specifications and harness assumptions were not updated and should be revised to assert the new exact floor/ceiling properties.
+- Added tests validate the four math helpers, but integration properties should still cover supply/withdraw, transfer, borrow/repay, account-data valuation, and liquidation-fee boundaries. In particular, maximum and near-maximum aToken burns/transfers should assert both scaled-balance clearing and collateral-flag behavior.
