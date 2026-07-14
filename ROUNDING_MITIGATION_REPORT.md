@@ -2,7 +2,7 @@
 
 ## Scope
 
-This repository is a SparkLend fork based on older Aave V3 code. The implemented mitigation is a narrow backport of the protocol-favoring rounding directions introduced in Aave v3.5 for high-value, low-decimal assets. It does not wholesale-backport Aave's intervening scaled-accounting, interface, event, or flag-management changes. It selectively adopts Aave v3.5's before-and-after aToken allowance calculation and its exact-allowance compatibility behavior.
+This repository is a SparkLend fork based on older Aave V3 code. The implemented mitigation is a narrow backport of the protocol-favoring rounding directions introduced in Aave v3.5 for high-value, low-decimal assets, together with Aave v3.6's correction to delegated variable-debt allowance accounting. It does not wholesale-backport Aave's intervening scaled-accounting, interface, event, or flag-management changes. It selectively adopts the before-and-after allowance calculations for aToken transfers and delegated variable borrowing, including their exact-request compatibility behavior.
 
 The fix is focused on the scaled-accounting and risk-valuation boundaries used by aTokens and variable debt tokens:
 
@@ -43,12 +43,16 @@ The variable-debt guarantees in this table do not extend to the stable debt toke
 - [Aave v3.5 WadRayMath](https://github.com/aave-dao/aave-v3-origin/blob/v3.5.0/src/contracts/protocol/libraries/math/WadRayMath.sol)
 - Aave v3.5 token implementations: `AToken.sol`, `VariableDebtToken.sol`, `ScaledBalanceTokenBase.sol`, and `IncentivizedERC20.sol`
 - Aave v3.5 protocol logic: `SupplyLogic.sol`, `BorrowLogic.sol`, `ValidationLogic.sol`, `GenericLogic.sol`, `ReserveLogic.sol`, and `LiquidationLogic.sol`
+- [Aave v3.6.0 `VariableDebtToken`](https://github.com/aave-dao/aave-v3-origin/blob/v3.6.0/src/contracts/protocol/tokenization/VariableDebtToken.sol)
+- [Aave v3.6.0 `DebtTokenBase`](https://github.com/aave-dao/aave-v3-origin/blob/v3.6.0/src/contracts/protocol/tokenization/base/DebtTokenBase.sol)
+- [Aave v3.6 correction using the `onBehalfOf` balance](https://github.com/aave-dao/aave-v3-origin/commit/0e4bedf6)
 
 ### Relevant local files
 
 - `contracts/protocol/libraries/math/WadRayMath.sol`
 - `contracts/protocol/tokenization/base/IncentivizedERC20.sol`
 - `contracts/protocol/tokenization/base/ScaledBalanceTokenBase.sol`
+- `contracts/protocol/tokenization/base/DebtTokenBase.sol`
 - `contracts/protocol/tokenization/AToken.sol`
 - `contracts/protocol/tokenization/VariableDebtToken.sol`
 - `contracts/protocol/libraries/logic/SupplyLogic.sol`
@@ -56,11 +60,13 @@ The variable-debt guarantees in this table do not extend to the stable debt toke
 - `contracts/protocol/libraries/logic/LiquidationLogic.sol`
 - `contracts/mocks/tests/WadRayMathWrapper.sol`
 - `contracts/mocks/tests/MockATokenPool.sol`
+- `contracts/mocks/tests/MockVariableDebtTokenPool.sol`
 - `test-suites/wadraymath.spec.ts`
 - `test-suites/atoken-allowance-rounding.spec.ts`
+- `test-suites/variable-debt-token-allowance-rounding.spec.ts`
 - `certora/specs/AToken.spec` and `certora/specs/VariableDebtToken.spec`, which still model the previous half-up rounding slack and require a separate formal-verification update
 
-## Chosen Approach: Explicit Rounding With Corrected Transfer Allowances
+## Chosen Approach: Explicit Rounding With Corrected Transfer and Borrow Allowances
 
 The chosen design represents the operation-specific mint and burn rounding context with an internal enum and passes it explicitly into the shared scaled-token accounting functions:
 
@@ -90,6 +96,7 @@ This approach was selected because it provides the required operation-specific r
 - It fails closed: a future shared mint or burn caller that supplies `INACTIVE` cannot silently fall back to half-up rounding.
 - It hardcodes the single safe transfer direction, removing an unnecessary mode parameter and its misuse surface.
 - It charges `transferFrom` allowance for the sender's actual indexed balance decrease whenever the allowance has sufficient headroom, preventing the rounding delta from recurring for free on every call.
+- It charges delegated borrow allowance for the debt owner's actual indexed debt increase whenever the allowance has sufficient headroom, preventing a delegatee from obtaining the rounded increment for free on every borrow.
 - It leaves existing half-up ray functions intact for unrelated protocol math, limiting behavioral change to the vulnerable boundaries.
 
 A persistent storage flag was not used because storage added to `ScaledBalanceTokenBase` could shift child-contract storage, while leaf-level flags would require hooks or duplicated state handling. Persistent state would also introduce extra gas and hidden mutable context. Transient storage was not used because the repository targets Solidity `0.8.10` and the London EVM, where it is unavailable without a broader compiler and deployment-target migration.
@@ -170,6 +177,32 @@ This compatibility rule means the absolute property “total balance moved can n
 
 Borrowing therefore records at least the requested debt, while repayment or liquidation cannot erase more scaled debt than the paid amount covers.
 
+### Variable debt delegation allowance alignment
+
+Rounding variable-debt minting up can make the debt recorded for `onBehalfOf` increase by more than the unscaled `amount` requested by the delegatee. Previously, `VariableDebtToken.mint` consumed only `amount` from the borrow allowance. A delegatee could therefore split borrowing into many rounding-sensitive calls and repeatedly receive a larger debt increase than the allowance consumed, potentially creating substantially more debt than the delegator approved.
+
+The mitigation follows Aave v3.6 and computes the exact before-and-after displayed debt increase of the debt owner:
+
+```text
+scaledAmount = ceil(amount * RAY / index)
+debtIncrease = ceil((ownerScaledBalance + scaledAmount) * index / RAY)
+             - ceil(ownerScaledBalance * index / RAY)
+```
+
+The owner balance is `super.balanceOf(onBehalfOf)`, not `super.balanceOf(user)`. This distinction is security-relevant: `user` is the delegatee initiating the borrow, while `onBehalfOf` is the delegator whose scaled balance and debt phase actually change. It also incorporates the Aave v3.6 correction to the earlier implementation that read the wrong account's balance.
+
+Because this fork's `VariableDebtToken.mint` ABI receives the unscaled `amount` rather than a precomputed scaled amount, it calculates `scaledAmount` internally with the same `rayDivCeil(index)` conversion used by `_mintScaled`. No Pool or public token interface was changed.
+
+`VariableDebtToken` passes the requested `amount` and corrected `debtIncrease` to the four-argument `DebtTokenBase._decreaseBorrowAllowance` helper. The helper:
+
+1. requires the current borrow allowance to cover the requested `amount`;
+2. consumes `debtIncrease` when the allowance has sufficient headroom;
+3. otherwise consumes the full remaining allowance, capping the corrected consumption at that allowance.
+
+The existing three-argument helper remains as a wrapper that passes `amount` as both values because `StableDebtToken` still uses nominal allowance accounting. The local `BorrowAllowanceDelegated` event behavior is also retained.
+
+As with Aave's aToken allowance correction, the cap deliberately preserves exact-request compatibility. If the allowance equals the requested `amount` but `debtIncrease` is larger because of rounding, the borrow succeeds and consumes the complete allowance. Consequently, the implementation does not establish the absolute property that recorded debt can never exceed nominal allowance. Instead, it prevents the correction from recurring for free: calls made while allowance headroom exists consume their actual debt increase, the boundary call consumes all remaining allowance, and later non-zero delegated borrows fail. Any nominal-allowance overrun is therefore limited to the rounding correction of the final successful call rather than accumulating across every split call.
+
 ### Maximum-withdraw alignment
 
 `contracts/protocol/libraries/logic/SupplyLogic.sol` recomputes the withdraw-side user balance with `rayMulFloor`.
@@ -205,8 +238,9 @@ The mitigation removes user-favoring half-up rounding from the affected scaled-a
 5. aToken collateral and variable-debt reads use the same pessimistic directions in account-data calculations.
 6. The final aggregate-debt price conversion rounds up, preventing positive, positively priced debt dust from disappearing solely in that division.
 7. `AToken.transferFrom` normally consumes the sender's actual indexed balance decrease, preventing the ceiling-rounding difference from being extracted for free on every call. The final call can retain Aave's bounded compatibility overrun when only the requested amount remains approved.
+8. Delegated variable borrowing normally consumes the debt owner's actual indexed debt increase, preventing the delegatee from accumulating one free rounding correction per split borrow. The final call retains the same bounded compatibility behavior when only the requested amount remains approved.
 
-The result is a protocol-favoring invariant at the changed aToken and variable-debt boundaries, while unrelated interest-index, flash-loan, bridge-fee, and general percentage math retain their existing behavior. It is not a complete backport of all Aave v3.5 precision and scaled-accounting changes.
+The result is a protocol-favoring invariant at the changed aToken and variable-debt boundaries, while unrelated interest-index, flash-loan, bridge-fee, and general percentage math retain their existing behavior. It is not a complete backport of all Aave v3.5 or v3.6 precision, scaled-accounting, and validation changes.
 
 ## Scope Boundaries and Follow-up Work
 
@@ -214,9 +248,10 @@ The result is a protocol-favoring invariant at the changed aToken and variable-d
 - Production public interfaces and Pool/token function signatures were not changed. As in Aave v3.5, the aToken ABI metadata now includes the inherited `ERC20InsufficientAllowance` custom error. Test-only helper contracts exercise the new math functions and deterministic reserve indices.
 - No persistent or transient storage was added.
 - Operation amounts still cross the existing production interfaces in unscaled units and are converted inside the tokens. The broader v3.5 change to pass scaled amounts through Pool validations and token calls was not backported.
-- The allowance correction is limited to `AToken.transferFrom`. Delegated variable borrowing retains its legacy requested-amount behavior, which can differ from the rounded debt change.
+- Delegated variable borrowing now corrects allowance consumption using the `onBehalfOf` debt owner's before-and-after indexed debt. The correction is intentionally capped at the current allowance, so an exact-request final borrow can still create the single-call rounding delta beyond the nominal remaining allowance. This is Aave's backward-compatible mitigation, not a strict post-mint debt-versus-allowance assertion.
+- No post-mint health-factor check was added. The change is limited to `VariableDebtToken.mint` allowance accounting and `DebtTokenBase._decreaseBorrowAllowance`. Existing Pool validation remains unchanged and operates before the rounded debt mint, so a boundary call can still leave the final health factor marginally lower than the nominal requested-amount calculation by the same single-call rounding correction. That residual was explicitly excluded from this mitigation.
 - Legacy `Mint`, `Burn`, and ERC-20 `Transfer` event values remain based on requested amounts and accrued interest rather than being recomputed from exact before/after indexed balances. `BalanceTransfer` is the exception and now reports the exact ceiling-rounded scaled transfer amount.
 - Withdraw and transfer collateral-flag updates still compare the requested unscaled amount with the floor-rounded pre-operation balance. A ceiling-rounded burn or transfer can consume the entire scaled balance even when a near-full explicit amount is slightly smaller than that displayed balance, so the legacy equality check can leave the collateral flag set with a zero scaled balance. The v3.5 scaled `finalizeTransfer` and balance-zero-after-burn flag changes were not backported and should be considered follow-up work.
 - The final `mintToTreasury` unscaled-to-scaled conversion now rounds down, but reserve-side treasury-accrual calculations were not changed. Broader cap, interest-index, flash-loan, bridge-fee, and percentage math was also intentionally left outside this patch.
 - Existing Certora specifications and harness assumptions were not updated and should be revised to assert the new exact floor/ceiling properties.
-- Added tests validate the four math helpers and the aToken allowance cases listed above. Broader integration properties should still cover supply/withdraw, transfer, borrow/repay, account-data valuation, and liquidation-fee boundaries. In particular, maximum and near-maximum aToken burns/transfers should assert both scaled-balance clearing and collateral-flag behavior.
+- Added tests validate the four math helpers, the aToken allowance cases, and delegated variable-debt allowance accounting. The variable-debt suite covers allowance consumption by actual debt increase, the `onBehalfOf` versus delegatee balance distinction, an existing owner balance phase, repeated split borrows, exact-request compatibility, exact conversions, and insufficient allowance. The focused suite passes 7 tests, and the combined variable- and stable-debt-token test run passes 37 tests. Broader integration properties should still cover supply/withdraw, transfer, borrow/repay, account-data valuation, and liquidation-fee boundaries. In particular, maximum and near-maximum aToken burns/transfers should assert both scaled-balance clearing and collateral-flag behavior.
