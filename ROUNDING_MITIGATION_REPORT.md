@@ -2,7 +2,7 @@
 
 ## Scope
 
-This repository is a SparkLend fork based on older Aave V3 code. The implemented mitigation is a narrow backport of the protocol-favoring rounding directions introduced in Aave v3.5 for high-value, low-decimal assets. It does not wholesale-backport Aave's intervening scaled-accounting, interface, allowance, event, or flag-management changes.
+This repository is a SparkLend fork based on older Aave V3 code. The implemented mitigation is a narrow backport of the protocol-favoring rounding directions introduced in Aave v3.5 for high-value, low-decimal assets. It does not wholesale-backport Aave's intervening scaled-accounting, interface, event, or flag-management changes. It selectively adopts Aave v3.5's before-and-after aToken allowance calculation and its exact-allowance compatibility behavior.
 
 The fix is focused on the scaled-accounting and risk-valuation boundaries used by aTokens and variable debt tokens:
 
@@ -14,7 +14,7 @@ The fix is focused on the scaled-accounting and risk-valuation boundaries used b
 
 The original fork used half-up rounding for ray arithmetic. In `WadRayMath`, `rayMul` adds `HALF_RAY` before division and `rayDiv` adds half of the divisor before division. Consequently, conversions between asset amounts and scaled balances can round either in favor of the user or in favor of the protocol depending on the reserve index and the exact amount.
 
-For an 18-decimal asset, a one-wei discrepancy is normally economically negligible. For a high-value, low-decimal asset such as a WBTC- or XAUT-like asset, one smallest unit can have meaningful value. Repeated supply, withdrawal, transfer, borrow, repay, or liquidation operations can therefore turn a one-unit user-favoring rounding error into an extractable loop.
+For an 18-decimal asset, a one-wei discrepancy is normally economically negligible. A high-value, low-decimal asset assigns more value to each smallest unit. Repeated supply, withdrawal, transfer, borrow, repay, or liquidation operations can therefore turn an atomic-unit user-favoring rounding error into an extractable loop.
 
 The protocol needs deterministic, pessimistic rounding at each accounting boundary:
 
@@ -47,6 +47,7 @@ The variable-debt guarantees in this table do not extend to the stable debt toke
 ### Relevant local files
 
 - `contracts/protocol/libraries/math/WadRayMath.sol`
+- `contracts/protocol/tokenization/base/IncentivizedERC20.sol`
 - `contracts/protocol/tokenization/base/ScaledBalanceTokenBase.sol`
 - `contracts/protocol/tokenization/AToken.sol`
 - `contracts/protocol/tokenization/VariableDebtToken.sol`
@@ -54,10 +55,12 @@ The variable-debt guarantees in this table do not extend to the stable debt toke
 - `contracts/protocol/libraries/logic/GenericLogic.sol`
 - `contracts/protocol/libraries/logic/LiquidationLogic.sol`
 - `contracts/mocks/tests/WadRayMathWrapper.sol`
+- `contracts/mocks/tests/MockATokenPool.sol`
 - `test-suites/wadraymath.spec.ts`
+- `test-suites/atoken-allowance-rounding.spec.ts`
 - `certora/specs/AToken.spec` and `certora/specs/VariableDebtToken.spec`, which still model the previous half-up rounding slack and require a separate formal-verification update
 
-## Chosen Approach: Rounding Direction Flag With Explicit Transfer Rounding
+## Chosen Approach: Explicit Rounding With Corrected Transfer Allowances
 
 The chosen design represents the operation-specific mint and burn rounding context with an internal enum and passes it explicitly into the shared scaled-token accounting functions:
 
@@ -79,13 +82,14 @@ The term _flag_ describes the operation-specific mint or burn direction, but the
 
 This approach was selected because it provides the required operation-specific rounding while keeping the patch narrow and compatible with the existing fork:
 
-- It preserves the public Pool, aToken, and variable debt token ABIs.
+- It preserves the public Pool, aToken, and variable debt token function signatures.
 - It does not add a state variable and therefore does not change upgradeable-token storage layouts.
 - It avoids state set-and-clear gas costs on common mint and burn paths.
 - It makes each rounding decision explicit at the call site, which improves auditability.
 - It centralizes the conversion logic instead of duplicating separate up/down mint and burn helpers.
 - It fails closed: a future shared mint or burn caller that supplies `INACTIVE` cannot silently fall back to half-up rounding.
 - It hardcodes the single safe transfer direction, removing an unnecessary mode parameter and its misuse surface.
+- It charges `transferFrom` allowance for the sender's actual indexed balance decrease whenever the allowance has sufficient headroom, preventing the rounding delta from recurring for free on every call.
 - It leaves existing half-up ray functions intact for unrelated protocol math, limiting behavioral change to the vulnerable boundaries.
 
 A persistent storage flag was not used because storage added to `ScaledBalanceTokenBase` could shift child-contract storage, while leaf-level flags would require hooks or duplicated state handling. Persistent state would also introduce extra gas and hidden mutable context. Transient storage was not used because the repository targets Solidity `0.8.10` and the London EVM, where it is unavailable without a broader compiler and deployment-target migration.
@@ -135,6 +139,26 @@ The visible balance conversions were also changed:
 
 `BalanceTransfer` emits the scaled amount calculated with the same `rayDivCeil` conversion used by the shared transfer helper. The ordinary ERC-20 `Transfer` event and the amount passed to `Pool.finalizeTransfer` remain the caller-requested unscaled amount; the precise rounded share movement is exposed by `BalanceTransfer`. Together, these changes prevent supply from over-crediting a user and ensure that withdrawal or transfer consumes enough scaled balance for the requested asset amount.
 
+### aToken transfer allowance alignment
+
+Ceiling conversion can make the sender's displayed aToken balance decrease by more than the requested transfer amount. Previously, `transferFrom` consumed only the requested unscaled amount from the allowance, so a spender could repeatedly move more aTokens than the owner had approved.
+
+Inspired by Aave v3.5, `AToken.transferFrom` now computes the sender-side unscaled `amountOut` from the sender's indexed balance before and after subtracting the ceiling-rounded scaled transfer:
+
+```text
+scaledAmount = ceil(amount * RAY / index)
+amountOut = floor(senderScaledBalance * index / RAY)
+          - floor((senderScaledBalance - scaledAmount) * index / RAY)
+```
+
+`AToken` passes both the requested `amount` and corrected `amountOut` to the Aave-inspired `_spendAllowance` helper. The helper first requires the current allowance to cover the requested amount. It then consumes `amountOut` when possible, capped at the current allowance.
+
+For an ordinary transfer, `amountOut` is the sender's actual displayed-balance decrease. It is deliberately not derived from the recipient's displayed-balance increase (`amountIn`), which can differ because the sender and recipient can have different floor-rounding positions. A self-transfer still consumes the corrected sender-side allowance even though crediting the same account restores its net balance, consistent with ERC-20 `transferFrom` allowance semantics.
+
+The cap matches Aave v3.5's compatibility behavior: if an owner approves exactly the requested amount, `transferFrom` still succeeds even when ceiling rounding makes `amountOut` larger. In that case the complete remaining allowance is consumed. The same cap applies when the remaining allowance is between `amount` and `amountOut`.
+
+This compatibility rule means the absolute property “total balance moved can never exceed the nominal allowance” does not hold. If split transfers leave at least the requested `amount` but less than `amountOut` for the final call, that call can move the correction gap beyond the remaining allowance. The overrun is bounded to that final call because the allowance becomes zero; preceding calls with sufficient headroom consume their complete `amountOut`, and subsequent non-zero calls fail. The change therefore prevents one free rounding increment per split call while preserving exact-allowance compatibility. It adds no public function or storage variable and does not alter the upgradeable storage layout.
+
 ### Variable debt mapping
 
 `contracts/protocol/tokenization/VariableDebtToken.sol` applies the opposite debt-safe directions:
@@ -180,18 +204,19 @@ The mitigation removes user-favoring half-up rounding from the affected scaled-a
 4. Repayment cannot cancel more variable debt than the payment covers.
 5. aToken collateral and variable-debt reads use the same pessimistic directions in account-data calculations.
 6. The final aggregate-debt price conversion rounds up, preventing positive, positively priced debt dust from disappearing solely in that division.
+7. `AToken.transferFrom` normally consumes the sender's actual indexed balance decrease, preventing the ceiling-rounding difference from being extracted for free on every call. The final call can retain Aave's bounded compatibility overrun when only the requested amount remains approved.
 
 The result is a protocol-favoring invariant at the changed aToken and variable-debt boundaries, while unrelated interest-index, flash-loan, bridge-fee, and general percentage math retain their existing behavior. It is not a complete backport of all Aave v3.5 precision and scaled-accounting changes.
 
 ## Scope Boundaries and Follow-up Work
 
 - Stable debt is deprecated and is not an intended supported borrowing path. Its rounding was intentionally left unchanged because backporting new behavior into an obsolete path would add implementation and verification cost without improving the supported variable-debt flow. Any legacy stable debt remains subject to `StableDebtToken.balanceOf`'s half-up rounding; the ceiling base-currency division cannot correct an amount already rounded down by that calculation.
-- Production public interfaces and Pool/token ABIs were not changed. The public test wrapper was extended solely to exercise the new library helpers.
+- Production public interfaces and Pool/token function signatures were not changed. As in Aave v3.5, the aToken ABI metadata now includes the inherited `ERC20InsufficientAllowance` custom error. Test-only helper contracts exercise the new math functions and deterministic reserve indices.
 - No persistent or transient storage was added.
 - Operation amounts still cross the existing production interfaces in unscaled units and are converted inside the tokens. The broader v3.5 change to pass scaled amounts through Pool validations and token calls was not backported.
-- Allowances retain legacy amount-based behavior: `AToken.transferFrom` and delegated variable borrowing consume the requested unscaled amount, which can differ from the rounded balance or debt change.
+- The allowance correction is limited to `AToken.transferFrom`. Delegated variable borrowing retains its legacy requested-amount behavior, which can differ from the rounded debt change.
 - Legacy `Mint`, `Burn`, and ERC-20 `Transfer` event values remain based on requested amounts and accrued interest rather than being recomputed from exact before/after indexed balances. `BalanceTransfer` is the exception and now reports the exact ceiling-rounded scaled transfer amount.
 - Withdraw and transfer collateral-flag updates still compare the requested unscaled amount with the floor-rounded pre-operation balance. A ceiling-rounded burn or transfer can consume the entire scaled balance even when a near-full explicit amount is slightly smaller than that displayed balance, so the legacy equality check can leave the collateral flag set with a zero scaled balance. The v3.5 scaled `finalizeTransfer` and balance-zero-after-burn flag changes were not backported and should be considered follow-up work.
 - The final `mintToTreasury` unscaled-to-scaled conversion now rounds down, but reserve-side treasury-accrual calculations were not changed. Broader cap, interest-index, flash-loan, bridge-fee, and percentage math was also intentionally left outside this patch.
 - Existing Certora specifications and harness assumptions were not updated and should be revised to assert the new exact floor/ceiling properties.
-- Added tests validate the four math helpers, but integration properties should still cover supply/withdraw, transfer, borrow/repay, account-data valuation, and liquidation-fee boundaries. In particular, maximum and near-maximum aToken burns/transfers should assert both scaled-balance clearing and collateral-flag behavior.
+- Added tests validate the four math helpers and the aToken allowance cases listed above. Broader integration properties should still cover supply/withdraw, transfer, borrow/repay, account-data valuation, and liquidation-fee boundaries. In particular, maximum and near-maximum aToken burns/transfers should assert both scaled-balance clearing and collateral-flag behavior.
